@@ -223,16 +223,17 @@ def merge_checkpoints(
             merged_sd[k] = slerp_tensor(m_val, p_val, t=t_slerp)
 
         elif method == "ties":
-            tau_merged, stats = ties_merge_tensors([tau_m, tau_p], density=density_ties, alpha=alpha_math)
+            tau_list = [alpha_math * tau_m, alpha_pref * tau_p]
+            tau_merged, stats = ties_merge_tensors(tau_list, density=density_ties, alpha=1.0, divide_by_count=False)
             merged_sd[k] = b_val + tau_merged
             for stat_k in stats:
                 if stat_k in aggregate_stats:
                     aggregate_stats[stat_k] += stats[stat_k]
 
         elif method == "dare_ties":
-            tau_m_dare = dare_tensors(tau_m, drop_rate=drop_dare)
-            tau_p_dare = dare_tensors(tau_p, drop_rate=drop_dare)
-            tau_merged, stats = ties_merge_tensors([tau_m_dare, tau_p_dare], density=density_ties, alpha=alpha_math)
+            tau_m_dare = dare_tensors(alpha_math * tau_m, drop_rate=drop_dare)
+            tau_p_dare = dare_tensors(alpha_pref * tau_p, drop_rate=drop_dare)
+            tau_merged, stats = ties_merge_tensors([tau_m_dare, tau_p_dare], density=density_ties, alpha=1.0, divide_by_count=False)
             merged_sd[k] = b_val + tau_merged
             for stat_k in stats:
                 if stat_k in aggregate_stats:
