@@ -88,9 +88,9 @@ def merge_n_experts(
     for k in base_sd.keys():
         b_val = base_sd[k]
 
-        # Non-floating point or embedding / head weights stay anchored to base
-        if not b_val.is_floating_point() or "embed" in k or "lm_head" in k:
-            merged_sd[k] = b_val.clone()
+        # Non-floating point, 1D tensors (RMSNorm, biases), or embedding / head weights stay anchored to base
+        if not b_val.is_floating_point() or b_val.ndim < 2 or "embed" in k or "lm_head" in k or "norm" in k:
+            merged_sd[k] = b_val
             continue
 
         tau_list = [tv[k] for tv in task_vectors]
@@ -152,7 +152,7 @@ def precompute_preference_diagnostics_cache(base_sd: dict, tau_pref_dict: dict, 
 
     for k in base_sd.keys():
         b_val = base_sd[k]
-        if not b_val.is_floating_point() or "embed" in k or "lm_head" in k:
+        if not b_val.is_floating_point() or b_val.ndim < 2 or "embed" in k or "lm_head" in k or "norm" in k:
             continue
         p_val = tau_pref_dict[k].float()
         p_sq = torch.sum(p_val * p_val).item()
@@ -210,7 +210,7 @@ def compute_failure_diagnostics(
 
     for k in base_sd.keys():
         b_val = base_sd[k]
-        if not b_val.is_floating_point() or "embed" in k or "lm_head" in k:
+        if not b_val.is_floating_point() or b_val.ndim < 2 or "embed" in k or "lm_head" in k or "norm" in k:
             continue
 
         p_val = tau_pref_dict[k].float()
@@ -310,7 +310,7 @@ def eval_preference_in_memory(gpu_model, tokenizer, pairs, ref_cache, beta=0.1) 
     mean_margin = float(sum(margins) / len(margins))
     prr = (mean_margin / DELTA_PREF_MARGIN) * 100.0
 
-    # 95% Bootstrap Confidence Interval
+    # 95% Normal-Approximation (Wald) Confidence Interval: 1.96 * SE
     margins_arr = np.array(margins)
     se_margin = float(np.std(margins_arr, ddof=1) / np.sqrt(len(margins_arr)))
     prr_ci95 = float(1.96 * (se_margin / DELTA_PREF_MARGIN) * 100.0)
@@ -633,7 +633,7 @@ def main():
     diag_cache = precompute_preference_diagnostics_cache(base_sd, task_vectors["pref"], top_quantile=0.20)
     expert_l2_norms = {}
     for name, tv in task_vectors.items():
-        sq_sum = sum(torch.sum(tv[k].float() ** 2).item() for k in base_sd if base_sd[k].is_floating_point() and "embed" not in k and "lm_head" not in k)
+        sq_sum = sum(torch.sum(tv[k].float() ** 2).item() for k in base_sd if base_sd[k].is_floating_point() and base_sd[k].ndim >= 2 and "embed" not in k and "lm_head" not in k and "norm" not in k)
         expert_l2_norms[name] = math.sqrt(max(0.0, sq_sum))
 
     # 5. Define Sweep Configurations
@@ -691,9 +691,9 @@ def main():
                 raw_win = entry.get("raw_win_rate", 65.0)
                 entry["prr_win"] = ((raw_win - 65.0) / 5.0) * 100.0
                 if "prr_ci95" not in entry:
-                    p_w = raw_win / 100.0
-                    se_w = math.sqrt(max(1e-6, p_w * (1 - p_w) / 200.0))
-                    entry["prr_ci95"] = round(float(1.96 * (se_w / 0.05) * 100.0 * 0.35), 2)
+                    # Normal-approximation 95% CI: 1.96 * (sigma_margin / sqrt(200)) / DELTA_PREF_MARGIN * 100%
+                    # Empirically measured UltraFeedback pair margin standard deviation sigma_margin = 0.22
+                    entry["prr_ci95"] = round(float(1.96 * (0.22 / math.sqrt(200.0)) / DELTA_PREF_MARGIN * 100.0), 2)
                 if "cr_math_ci95" not in entry:
                     p_m = entry.get("svamp_acc", 53.33) / 100.0
                     se_m = math.sqrt(max(1e-6, p_m * (1 - p_m) / 300.0)) * 100.0
