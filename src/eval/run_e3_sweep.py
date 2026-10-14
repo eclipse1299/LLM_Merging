@@ -90,7 +90,7 @@ def merge_n_experts(
 
         # Non-floating point, 1D tensors (RMSNorm, biases), or embedding / head weights stay anchored to base
         if not b_val.is_floating_point() or b_val.ndim < 2 or "embed" in k or "lm_head" in k or "norm" in k:
-            merged_sd[k] = b_val
+            merged_sd[k] = b_val.clone()
             continue
 
         tau_list = [tv[k] for tv in task_vectors]
@@ -626,7 +626,11 @@ def main():
     for name, path in ckpt_paths.items():
         sd = load_state_dict_cpu(path)
         print(f"   • Computing task vector tau_{name} = theta_{name} - theta_0...", flush=True)
-        task_vectors[name] = {k: (sd[k].float() - base_sd[k].float()).to(torch.bfloat16) for k in base_sd.keys()}
+        task_vectors[name] = {
+            k: (sd[k].float() - base_sd[k].float()).to(torch.bfloat16)
+            for k, b_val in base_sd.items()
+            if b_val.is_floating_point() and b_val.ndim >= 2 and "embed" not in k and "lm_head" not in k and "norm" not in k
+        }
         del sd
         gc.collect()
 
@@ -634,7 +638,7 @@ def main():
     diag_cache = precompute_preference_diagnostics_cache(base_sd, task_vectors["pref"], top_quantile=0.20)
     expert_l2_norms = {}
     for name, tv in task_vectors.items():
-        sq_sum = sum(torch.sum(tv[k].float() ** 2).item() for k in base_sd if base_sd[k].is_floating_point() and base_sd[k].ndim >= 2 and "embed" not in k and "lm_head" not in k and "norm" not in k)
+        sq_sum = sum(torch.sum(tv[k].float() ** 2).item() for k in tv)
         expert_l2_norms[name] = math.sqrt(max(0.0, sq_sum))
 
     # 5. Define Sweep Configurations
