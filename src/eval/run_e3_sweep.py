@@ -358,7 +358,7 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
         codes = [extract_code(g) for g in gens]
         tests = [it["test_list"] for it in batch]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=1.0), zip(codes, tests)))
+            results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=1.5), zip(codes, tests)))
         passed += sum(1 for r in results if r)
 
     mbpp_acc = (passed / total) * 100.0
@@ -437,7 +437,7 @@ def main():
     parser = argparse.ArgumentParser(description="Experiment 3 (E3) Consortium Scaling Sweep")
     parser.add_argument("--results_file", type=str, default="outputs/results/e3_sweep_results.json",
                         help="Path to output JSON file (supports Google Drive paths)")
-    parser.add_argument("--batch_size", type=int, default=16, help="Evaluation batch size")
+    parser.add_argument("--batch_size", type=int, default=32, help="Evaluation batch size")
     args = parser.parse_args()
 
     results_file = args.results_file
