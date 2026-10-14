@@ -1,5 +1,5 @@
 """
-Experiment 3 (E3): Consortium Scaling (N in {2, 3, 4}) and Predictors of Failure (E8).
+Experiment 3 (E3): Consortium Scaling (N in {3, 4}; N=2 integrated from E2) and Predictors of Failure (E8).
 In-Memory GPU Swapper, Crash-Resumable Checkpointing, and Diagnostic Collector.
 
 Features:
@@ -99,7 +99,7 @@ def merge_n_experts(
             tau_merged = torch.zeros_like(b_val, dtype=torch.float32)
             for w, tau in zip(weights, tau_list):
                 tau_merged += w * tau.float()
-            tau_merged_dict[k] = tau_merged.to(torch.bfloat16)
+            tau_merged_dict[k] = tau_merged
             merged_sd[k] = (b_val.float() + tau_merged).to(b_val.dtype)
 
         elif method == "ties":
@@ -111,7 +111,7 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False  # Crucial: sum agreeing pre-weighted coordinates
             )
-            tau_merged_dict[k] = tau_ties.to(torch.bfloat16)
+            tau_merged_dict[k] = tau_ties.float()
             merged_sd[k] = (b_val.float() + tau_ties.float()).to(b_val.dtype)
 
         elif method == "dare_ties":
@@ -129,7 +129,7 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False
             )
-            tau_merged_dict[k] = tau_dare_ties.to(torch.bfloat16)
+            tau_merged_dict[k] = tau_dare_ties.float()
             merged_sd[k] = (b_val.float() + tau_dare_ties.float()).to(b_val.dtype)
 
         else:
@@ -702,6 +702,10 @@ def main():
                     p_c = entry.get("mbpp_acc", 31.13) / 100.0
                     se_c = math.sqrt(max(1e-6, p_c * (1 - p_c) / 257.0)) * 100.0
                     entry["cr_code_ci95"] = float(1.96 * (se_c / DELTA_CODE) * 100.0)
+                if "cr_instr_ci95" not in entry and N == 4:
+                    p_i = entry.get("ifeval_acc", 29.6667) / 100.0
+                    se_i = math.sqrt(max(1e-6, p_i * (1 - p_i) / 300.0)) * 100.0
+                    entry["cr_instr_ci95"] = float(1.96 * (se_i / DELTA_INSTR) * 100.0)
 
                 backfilled_count += 1
 
