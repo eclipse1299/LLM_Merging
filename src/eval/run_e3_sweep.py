@@ -33,6 +33,7 @@ import json
 import math
 import shutil
 import argparse
+import concurrent.futures
 import numpy as np
 import torch
 torch.set_num_threads(4)
@@ -354,11 +355,11 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
                 eos_token_id=eos_ids
             )
         gens = tokenizer.batch_decode(outputs[:, in_len:], skip_special_tokens=True)
-        for it, gen in zip(batch, gens):
-            code = extract_code(gen)
-            test_assertions = it["test_list"]
-            if run_with_timeout(code, test_assertions, timeout=3.0):
-                passed += 1
+        codes = [extract_code(g) for g in gens]
+        tests = [it["test_list"] for it in batch]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=1.0), zip(codes, tests)))
+        passed += sum(1 for r in results if r)
 
     mbpp_acc = (passed / total) * 100.0
     cr_code = ((mbpp_acc - B0_CODE_ACC) / DELTA_CODE) * 100.0
