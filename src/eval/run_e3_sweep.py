@@ -583,6 +583,7 @@ def main():
         attn_implementation=ATTN_IMPLEMENTATION
     ).to(device)
     gpu_model.eval()
+    gpu_model.tie_weights()
 
     # 3. Reference Log-Probabilities Cache for B_0
     ref_cache_file = "outputs/results/b0_pref_200_cache.json"
@@ -685,15 +686,20 @@ def main():
                     pref_idx=0
                 )
                 entry["diagnostics"] = new_diag
-                del merged_sd, tau_merged
 
-                # Backfill dual PRR and CIs analytically
-                raw_win = entry.get("raw_win_rate", 65.0)
-                entry["prr_win"] = ((raw_win - 65.0) / 5.0) * 100.0
+                # Evaluate true continuous margin CI on GPU (<1.4s) if missing
                 if "prr_ci95" not in entry:
-                    # Normal-approximation 95% CI: 1.96 * (sigma_margin / sqrt(200)) / DELTA_PREF_MARGIN * 100%
-                    # Empirically measured UltraFeedback pair margin standard deviation sigma_margin = 0.22
-                    entry["prr_ci95"] = round(float(1.96 * (0.22 / math.sqrt(200.0)) / DELTA_PREF_MARGIN * 100.0), 2)
+                    with torch.no_grad():
+                        gpu_model.load_state_dict(merged_sd, strict=True)
+                        gpu_model.tie_weights()
+                    raw_win, dpo_margin, prr, prr_win, prr_ci95 = eval_preference_in_memory(gpu_model, tokenizer, pref_pairs, ref_cache)
+                    entry["prr_ci95"] = prr_ci95
+                    entry["prr_win"] = prr_win
+                else:
+                    raw_win = entry.get("raw_win_rate", 65.0)
+                    entry["prr_win"] = ((raw_win - 65.0) / 5.0) * 100.0
+
+                del merged_sd, tau_merged
                 if "cr_math_ci95" not in entry:
                     p_m = entry.get("svamp_acc", 53.33) / 100.0
                     se_m = math.sqrt(max(1e-6, p_m * (1 - p_m) / 300.0)) * 100.0
