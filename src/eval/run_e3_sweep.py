@@ -75,13 +75,13 @@ def merge_n_experts(
     task_vectors: list[dict],
     density: float = 0.20,
     drop_rate: float = 0.50
-) -> dict:
+) -> tuple[dict, dict]:
     """
     Merges N task vectors onto base_sd with simplex weights sum(weights) == 1.0.
-    task_vectors: [tau_pref, tau_domain1, tau_domain2, ...]
-    weights: [w_pref, w_domain1, w_domain2, ...]
+    Returns: (merged_sd, tau_merged_dict)
     """
     merged_sd = {}
+    tau_merged_dict = {}
     N = len(task_vectors)
     generators = [torch.Generator(device="cpu").manual_seed(RANDOM_SEED + j) for j in range(N)]
 
@@ -96,10 +96,11 @@ def merge_n_experts(
         tau_list = [tv[k] for tv in task_vectors]
 
         if method == "linear":
-            tau_merged = torch.zeros_like(b_val)
+            tau_merged = torch.zeros_like(b_val, dtype=torch.float32)
             for w, tau in zip(weights, tau_list):
-                tau_merged += w * tau
-            merged_sd[k] = b_val + tau_merged
+                tau_merged += w * tau.float()
+            tau_merged_dict[k] = tau_merged.to(torch.bfloat16)
+            merged_sd[k] = b_val + tau_merged_dict[k]
 
         elif method == "ties":
             # Scale each task vector by its simplex weight before sign election
@@ -110,7 +111,8 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False  # Crucial: sum agreeing pre-weighted coordinates
             )
-            merged_sd[k] = b_val + tau_ties.to(b_val.dtype)
+            tau_merged_dict[k] = tau_ties.to(torch.bfloat16)
+            merged_sd[k] = b_val + tau_merged_dict[k]
 
         elif method == "dare_ties":
             # Deterministic DARE with independent random dropout across all layers
@@ -127,12 +129,13 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False
             )
-            merged_sd[k] = b_val + tau_dare_ties.to(b_val.dtype)
+            tau_merged_dict[k] = tau_dare_ties.to(torch.bfloat16)
+            merged_sd[k] = b_val + tau_merged_dict[k]
 
         else:
             raise ValueError(f"Unknown merge method: {method}")
 
-    return merged_sd
+    return merged_sd, tau_merged_dict
 
 
 # ==========================================
@@ -159,9 +162,9 @@ def precompute_preference_diagnostics_cache(base_sd: dict, tau_pref_dict: dict, 
         p_flat = p_val.flatten()
         k_top = int(top_quantile * p_flat.numel())
         if k_top > 0 and p_sq > 1e-12:
-            topk_vals, _ = torch.topk(torch.abs(p_flat), k_top)
-            thresh = topk_vals[-1]
-            top_mask = (torch.abs(p_flat) >= thresh) & (p_flat != 0)
+            _, topk_idx = torch.topk(torch.abs(p_flat), k_top)
+            top_mask = torch.zeros_like(p_flat, dtype=torch.bool)
+            top_mask[topk_idx] = (p_flat[topk_idx] != 0)
             pref_masks[k] = top_mask
             pref_signs[k] = torch.sign(p_flat[top_mask])
             total_top_coords += int(top_mask.sum().item())
@@ -178,7 +181,7 @@ def precompute_preference_diagnostics_cache(base_sd: dict, tau_pref_dict: dict, 
 def compute_failure_diagnostics(
     base_sd: dict,
     tau_pref_dict: dict,
-    merged_sd: dict,
+    tau_merged_dict: dict,
     weights: list[float],
     expert_norms: list[float],
     diag_cache: dict,
@@ -211,7 +214,8 @@ def compute_failure_diagnostics(
             continue
 
         p_val = tau_pref_dict[k].float()
-        m_val = (merged_sd[k] - b_val).float()
+        # Direct from merged task vector: zero underflow/rounding against base weights!
+        m_val = tau_merged_dict[k].float()
 
         dot_merged_pref += torch.sum(m_val * p_val).item()
         norm_sq_merged += torch.sum(m_val * m_val).item()
@@ -408,9 +412,9 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=64) -> tupl
         all_codes.extend(extract_code(g) for g in gens)
         all_tests.extend(tests)
 
-    # 2. Execute all 257 test suites in parallel across workers
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=1.5), zip(all_codes, all_tests)))
+    # 2. Execute all 257 test suites in parallel across workers without CPU contention
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=3.0), zip(all_codes, all_tests)))
     passed_arr = np.array([1 if r else 0 for r in results])
 
     mbpp_acc = (float(passed_arr.sum()) / total) * 100.0
@@ -621,7 +625,7 @@ def main():
     for name, path in ckpt_paths.items():
         sd = load_state_dict_cpu(path)
         print(f"   • Computing task vector tau_{name} = theta_{name} - theta_0...", flush=True)
-        task_vectors[name] = {k: (sd[k] - base_sd[k]).to(torch.bfloat16) for k in base_sd.keys()}
+        task_vectors[name] = {k: (sd[k].float() - base_sd[k].float()).to(torch.bfloat16) for k in base_sd.keys()}
         del sd
         gc.collect()
 
@@ -663,7 +667,7 @@ def main():
                 active_norms = [expert_l2_norms[name] for name in active_expert_names]
 
                 # Merge on CPU (<0.05s)
-                merged_sd = merge_n_experts(
+                merged_sd, tau_merged = merge_n_experts(
                     method=method,
                     weights=weights,
                     base_sd=base_sd,
@@ -674,14 +678,14 @@ def main():
                 new_diag = compute_failure_diagnostics(
                     base_sd=base_sd,
                     tau_pref_dict=task_vectors["pref"],
-                    merged_sd=merged_sd,
+                    tau_merged_dict=tau_merged,
                     weights=weights,
                     expert_norms=active_norms,
                     diag_cache=diag_cache,
                     pref_idx=0
                 )
                 entry["diagnostics"] = new_diag
-                del merged_sd
+                del merged_sd, tau_merged
 
                 # Backfill dual PRR and CIs analytically
                 raw_win = entry.get("raw_win_rate", 65.0)
@@ -732,7 +736,7 @@ def main():
                 print(f"[{run_idx}/{total_runs}] Merging {key}: w_pref={alpha_pref:.4f}, w_domain={w_domain:.4f}...", flush=True)
 
                 # Merge on CPU (<2.0s)
-                merged_sd = merge_n_experts(
+                merged_sd, tau_merged = merge_n_experts(
                     method=method,
                     weights=weights,
                     base_sd=base_sd,
@@ -745,7 +749,7 @@ def main():
                 diagnostics = compute_failure_diagnostics(
                     base_sd=base_sd,
                     tau_pref_dict=task_vectors["pref"],
-                    merged_sd=merged_sd,
+                    tau_merged_dict=tau_merged,
                     weights=weights,
                     expert_norms=active_norms,
                     diag_cache=diag_cache,
@@ -754,7 +758,7 @@ def main():
 
                 # In-Place Weight Swap to GPU (<0.1s)
                 gpu_model.load_state_dict(merged_sd, strict=True)
-                del merged_sd
+                del merged_sd, tau_merged
                 gc.collect()
 
                 # Run Evaluations with live sub-step reporting
