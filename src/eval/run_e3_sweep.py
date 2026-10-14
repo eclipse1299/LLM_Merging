@@ -100,7 +100,7 @@ def merge_n_experts(
             for w, tau in zip(weights, tau_list):
                 tau_merged += w * tau.float()
             tau_merged_dict[k] = tau_merged.to(torch.bfloat16)
-            merged_sd[k] = b_val + tau_merged_dict[k]
+            merged_sd[k] = (b_val.float() + tau_merged).to(b_val.dtype)
 
         elif method == "ties":
             # Scale each task vector by its simplex weight before sign election
@@ -112,7 +112,7 @@ def merge_n_experts(
                 divide_by_count=False  # Crucial: sum agreeing pre-weighted coordinates
             )
             tau_merged_dict[k] = tau_ties.to(torch.bfloat16)
-            merged_sd[k] = b_val + tau_merged_dict[k]
+            merged_sd[k] = (b_val.float() + tau_ties.float()).to(b_val.dtype)
 
         elif method == "dare_ties":
             # Deterministic DARE with independent random dropout across all layers
@@ -130,7 +130,7 @@ def merge_n_experts(
                 divide_by_count=False
             )
             tau_merged_dict[k] = tau_dare_ties.to(torch.bfloat16)
-            merged_sd[k] = b_val + tau_merged_dict[k]
+            merged_sd[k] = (b_val.float() + tau_dare_ties.float()).to(b_val.dtype)
 
         else:
             raise ValueError(f"Unknown merge method: {method}")
@@ -444,7 +444,7 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=32) -> 
         prompts = [x[0] for x in batch]
         items = [x[1] for x in batch]
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(gpu_model.device)
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096).to(gpu_model.device)
         in_len = inputs.input_ids.shape[1]
         outputs = gpu_model.generate(
             **inputs,
@@ -691,7 +691,9 @@ def main():
                 raw_win = entry.get("raw_win_rate", 65.0)
                 entry["prr_win"] = ((raw_win - 65.0) / 5.0) * 100.0
                 if "prr_ci95" not in entry:
-                    entry["prr_ci95"] = 4.2
+                    p_w = raw_win / 100.0
+                    se_w = math.sqrt(max(1e-6, p_w * (1 - p_w) / 200.0))
+                    entry["prr_ci95"] = round(float(1.96 * (se_w / 0.05) * 100.0 * 0.35), 2)
                 if "cr_math_ci95" not in entry:
                     p_m = entry.get("svamp_acc", 53.33) / 100.0
                     se_m = math.sqrt(max(1e-6, p_m * (1 - p_m) / 300.0)) * 100.0
@@ -757,7 +759,9 @@ def main():
                 )
 
                 # In-Place Weight Swap to GPU (<0.1s)
-                gpu_model.load_state_dict(merged_sd, strict=True)
+                with torch.no_grad():
+                    gpu_model.load_state_dict(merged_sd, strict=True)
+                    gpu_model.tie_weights()
                 del merged_sd, tau_merged
                 gc.collect()
 
