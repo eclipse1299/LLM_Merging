@@ -30,7 +30,8 @@ def run_with_timeout(program: str, test_assertions: list[str], timeout: float = 
         p = subprocess.Popen(
             [sys.executable, "-c", full_code],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL
         )
         try:
             ret = p.wait(timeout=timeout)

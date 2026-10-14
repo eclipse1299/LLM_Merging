@@ -137,31 +137,68 @@ def merge_n_experts(
 # ==========================================
 # Five Mechanistic Predictors of Failure (E8)
 # ==========================================
+def precompute_preference_diagnostics_cache(base_sd: dict, tau_pref_dict: dict, top_quantile: float = 0.20) -> dict:
+    """Pre-computes top-20% masks and preference energy once at startup to avoid repeated topk calls."""
+    print("⚡ Pre-computing top-20% preference masks and norms (one-time startup)...", flush=True)
+    pref_masks = {}
+    pref_signs = {}
+    layer_p_norm_sq = {}
+    total_top_coords = 0
+    norm_sq_pref = 0.0
+
+    for k in base_sd.keys():
+        b_val = base_sd[k]
+        if not b_val.is_floating_point() or "embed" in k or "lm_head" in k:
+            continue
+        p_val = tau_pref_dict[k].float()
+        p_sq = torch.sum(p_val * p_val).item()
+        norm_sq_pref += p_sq
+        layer_p_norm_sq[k] = p_sq
+
+        p_flat = p_val.flatten()
+        k_top = int(top_quantile * p_flat.numel())
+        if k_top > 0 and p_sq > 1e-12:
+            topk_vals, _ = torch.topk(torch.abs(p_flat), k_top)
+            thresh = topk_vals[-1]
+            top_mask = (torch.abs(p_flat) >= thresh) & (p_flat != 0)
+            pref_masks[k] = top_mask
+            pref_signs[k] = torch.sign(p_flat[top_mask])
+            total_top_coords += int(top_mask.sum().item())
+
+    return {
+        "pref_masks": pref_masks,
+        "pref_signs": pref_signs,
+        "layer_p_norm_sq": layer_p_norm_sq,
+        "total_top_coords": total_top_coords,
+        "norm_sq_pref": norm_sq_pref
+    }
+
+
 def compute_failure_diagnostics(
     base_sd: dict,
-    task_vectors: list[dict],
+    tau_pref_dict: dict,
     merged_sd: dict,
     weights: list[float],
-    pref_idx: int = 0,
-    top_quantile: float = 0.20
+    expert_norms: list[float],
+    diag_cache: dict,
+    pref_idx: int = 0
 ) -> dict:
     """
-    Computes all 5 theoretical failure predictors in CPU RAM:
+    Computes all 5 failure diagnostics in CPU RAM in <0.1s using precomputed masks:
     1. eta_pref: Effective Preference Magnitude Share
     2. clash_overruled: Preference Sign-Overrule Rate on top-20% coordinates
     3. csim_surv: Directional Alignment Survival cos(tau_merged, tau_pref)
     4. pi_pref: Preference Projection Recovery <tau_merged, tau_pref> / ||tau_pref||^2
     5. clash_weighted: Importance-Weighted Sign Overrule Rate (Fisher proxy)
     """
-    tau_pref_dict = task_vectors[pref_idx]
+    pref_masks = diag_cache["pref_masks"]
+    pref_signs = diag_cache["pref_signs"]
+    layer_p_norm_sq = diag_cache["layer_p_norm_sq"]
+    total_top_coords = diag_cache["total_top_coords"]
+    norm_sq_pref = diag_cache["norm_sq_pref"]
 
-    # Pre-accumulate scalar dot products and squared norms
     dot_merged_pref = 0.0
     norm_sq_merged = 0.0
-    norm_sq_pref = 0.0
-    norm_sq_per_expert = [0.0] * len(task_vectors)
-
-    total_top_coords = 0
     total_clash_coords = 0
     layer_clash_data = []
 
@@ -173,46 +210,27 @@ def compute_failure_diagnostics(
         p_val = tau_pref_dict[k].float()
         m_val = (merged_sd[k] - b_val).float()
 
-        # Dot product and norms
-        dot_k = torch.sum(m_val * p_val).item()
-        m_sq = torch.sum(m_val * m_val).item()
-        p_sq = torch.sum(p_val * p_val).item()
+        dot_merged_pref += torch.sum(m_val * p_val).item()
+        norm_sq_merged += torch.sum(m_val * m_val).item()
 
-        dot_merged_pref += dot_k
-        norm_sq_merged += m_sq
-        norm_sq_pref += p_sq
-
-        for j, tv in enumerate(task_vectors):
-            norm_sq_per_expert[j] += torch.sum(tv[k].float() ** 2).item()
-
-        # Top-20% sign overrule calculation per tensor
-        p_flat = p_val.flatten()
-        m_flat = m_val.flatten()
-        k_top = int(top_quantile * p_flat.numel())
-
-        if k_top > 0 and p_sq > 1e-12:
-            topk_vals, _ = torch.topk(torch.abs(p_flat), k_top)
-            thresh = topk_vals[-1]
-            top_mask = (torch.abs(p_flat) >= thresh) & (p_flat != 0)
-
-            sign_p = torch.sign(p_flat[top_mask])
-            sign_m = torch.sign(m_flat[top_mask])
+        if k in pref_masks:
+            mask = pref_masks[k]
+            sign_p = pref_signs[k]
+            m_flat = m_val.flatten()
+            sign_m = torch.sign(m_flat[mask])
             clashed = (sign_p != sign_m)
 
-            n_top = int(top_mask.sum().item())
+            n_top = len(sign_p)
             n_clash = int(clashed.sum().item())
 
-            total_top_coords += n_top
             total_clash_coords += n_clash
-
             layer_clash_data.append({
-                "layer_p_norm_sq": p_sq,
+                "layer_p_norm_sq": layer_p_norm_sq[k],
                 "layer_top_coords": n_top,
                 "layer_clash_coords": n_clash
             })
 
     # 1. Effective Preference Magnitude Share (eta_pref)
-    expert_norms = [math.sqrt(max(0.0, s)) for s in norm_sq_per_expert]
     weighted_norms = [w * n for w, n in zip(weights, expert_norms)]
     sum_weighted_norms = sum(weighted_norms)
     eta_pref = (weighted_norms[pref_idx] / max(1e-12, sum_weighted_norms)) if sum_weighted_norms > 0 else 0.0
@@ -382,12 +400,21 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> 
 # Atomic Save Utility
 # ==========================================
 def save_atomic_json(filepath: str, data: dict):
-    """Writes results atomically via a temporary file to prevent corruption."""
+    """Writes results atomically with fallback for Google Drive FUSE."""
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
     temp_path = filepath + ".tmp"
-    with open(temp_path, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(temp_path, filepath)
+    try:
+        with open(temp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(temp_path, filepath)
+    except Exception:
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 
 # ==========================================
@@ -518,10 +545,17 @@ def main():
     task_vectors = {}
     for name, path in ckpt_paths.items():
         sd = load_state_dict_cpu(path)
-        print(f"   • Computing task vector tau_{name} = theta_{name} - theta_0...")
+        print(f"   • Computing task vector tau_{name} = theta_{name} - theta_0...", flush=True)
         task_vectors[name] = {k: (sd[k] - base_sd[k]).to(torch.bfloat16) for k in base_sd.keys()}
         del sd
         gc.collect()
+
+    # Precompute Diagnostics Cache & Expert Norms Once at Startup
+    diag_cache = precompute_preference_diagnostics_cache(base_sd, task_vectors["pref"], top_quantile=0.20)
+    expert_l2_norms = {}
+    for name, tv in task_vectors.items():
+        sq_sum = sum(torch.sum(tv[k].float() ** 2).item() for k in base_sd if base_sd[k].is_floating_point() and "embed" not in k and "lm_head" not in k)
+        expert_l2_norms[name] = math.sqrt(max(0.0, sq_sum))
 
     # 5. Define Sweep Configurations
     # N=3: [E_pref, E_math, E_code]
@@ -541,16 +575,17 @@ def main():
     }
 
     total_runs = (len(grid_n3) + len(grid_n4)) * len(methods)
-    print(f"\n==================================================================")
-    print(f"📊 Starting Execution Loop: {total_runs} Total Checkpoints")
-    print(f"   • N=3: {len(grid_n3)} weights x {len(methods)} methods = {len(grid_n3) * len(methods)} runs")
-    print(f"   • N=4: {len(grid_n4)} weights x {len(methods)} methods = {len(grid_n4) * len(methods)} runs")
-    print(f"==================================================================\n")
+    print(f"\n==================================================================", flush=True)
+    print(f"📊 Starting Execution Loop: {total_runs} Total Checkpoints", flush=True)
+    print(f"   • N=3: {len(grid_n3)} weights x {len(methods)} methods = {len(grid_n3) * len(methods)} runs", flush=True)
+    print(f"   • N=4: {len(grid_n4)} weights x {len(methods)} methods = {len(grid_n4) * len(methods)} runs", flush=True)
+    print(f"==================================================================\n", flush=True)
 
     run_idx = 0
     for N in [3, 4]:
         active_expert_names = tasks_by_n[N]
         active_tvs = [task_vectors[name] for name in active_expert_names]
+        active_norms = [expert_l2_norms[name] for name in active_expert_names]
         alphas = grids_by_n[N]
 
         for method in methods:
@@ -559,15 +594,15 @@ def main():
                 key = f"N{N}_{method}_{alpha_pref:.4f}"
 
                 if key in results_dict:
-                    print(f"[{run_idx}/{total_runs}] Skipping {key} (Already Evaluated).")
+                    print(f"[{run_idx}/{total_runs}] Skipping {key} (Already Evaluated).", flush=True)
                     continue
 
                 w_domain = (1.0 - alpha_pref) / (N - 1)
                 weights = [alpha_pref] + [w_domain] * (N - 1)
 
-                print(f"[{run_idx}/{total_runs}] Merging {key}: w_pref={alpha_pref:.4f}, w_domain={w_domain:.4f}...")
+                print(f"[{run_idx}/{total_runs}] Merging {key}: w_pref={alpha_pref:.4f}, w_domain={w_domain:.4f}...", flush=True)
 
-                # Merge on CPU
+                # Merge on CPU (<2.0s)
                 merged_sd = merge_n_experts(
                     method=method,
                     weights=weights,
@@ -577,24 +612,30 @@ def main():
                     drop_rate=0.50
                 )
 
-                # Compute Failure Diagnostics (E8)
+                # Compute Failure Diagnostics (E8) in <0.1s
                 diagnostics = compute_failure_diagnostics(
                     base_sd=base_sd,
-                    task_vectors=active_tvs,
+                    tau_pref_dict=task_vectors["pref"],
                     merged_sd=merged_sd,
                     weights=weights,
-                    pref_idx=0,
-                    top_quantile=0.20
+                    expert_norms=active_norms,
+                    diag_cache=diag_cache,
+                    pref_idx=0
                 )
 
-                # In-Place Weight Swap to GPU
+                # In-Place Weight Swap to GPU (<0.1s)
                 gpu_model.load_state_dict(merged_sd, strict=True)
                 del merged_sd
                 gc.collect()
 
-                # Run Evaluations
+                # Run Evaluations with live sub-step reporting
+                print(f"   • Evaluating Preference (200 pairs)...", flush=True)
                 raw_win, dpo_margin, prr = eval_preference_in_memory(gpu_model, tokenizer, pref_pairs, ref_cache)
+
+                print(f"   • Evaluating SVAMP (300 items)...", flush=True)
                 svamp_acc, cr_math = eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=args.batch_size)
+
+                print(f"   • Evaluating MBPP (257 items)...", flush=True)
                 mbpp_acc, cr_code = eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=args.batch_size)
 
                 result_entry = {
@@ -613,16 +654,17 @@ def main():
                 }
 
                 if N == 4:
+                    print(f"   • Evaluating IFEval (300 prompts)...", flush=True)
                     ifeval_acc, cr_instr = eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=args.batch_size)
                     mean_cr = (cr_math + cr_code + cr_instr) / 3.0
                     result_entry["ifeval_acc"] = ifeval_acc
                     result_entry["cr_instr"] = cr_instr
                     result_entry["mean_cr"] = mean_cr
-                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | CR_i: {cr_instr:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}")
+                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | CR_i: {cr_instr:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}", flush=True)
                 else:
                     mean_cr = (cr_math + cr_code) / 2.0
                     result_entry["mean_cr"] = mean_cr
-                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}")
+                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}", flush=True)
 
                 # Atomic save to disk
                 results_dict[key] = result_entry
