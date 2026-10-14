@@ -119,7 +119,7 @@ def merge_n_experts(
             keep_prob = 1.0 - drop_rate
             dare_taus = []
             for j, (w, tau) in enumerate(zip(weights, tau_list)):
-                mask = torch.bernoulli(torch.full_like(tau.float(), keep_prob), generator=generators[j]).to(torch.bool)
+                mask = torch.empty_like(tau, dtype=torch.float32).bernoulli_(keep_prob, generator=generators[j])
                 tau_rescaled = (tau.float() * mask) / keep_prob
                 dare_taus.append(w * tau_rescaled)
 
@@ -718,10 +718,10 @@ def main():
                     entry["cr_instr_ci95"] = float(1.96 * (se_i / DELTA_INSTR) * 100.0)
 
                 backfilled_count += 1
+                save_atomic_json(results_file, results_dict)
 
         if backfilled_count > 0:
             print(f"✨ Backfilled new E8 diagnostics (sign_flip_rate, zero_prune_rate) and CIs for {backfilled_count} existing checkpoints on CPU!\n")
-            save_atomic_json(results_file, results_dict)
 
     total_runs = (len(grid_n3) + len(grid_n4)) * len(methods)
     print(f"\n==================================================================", flush=True)
@@ -825,6 +825,8 @@ def main():
                 # Atomic save to disk
                 results_dict[key] = result_entry
                 save_atomic_json(results_file, results_dict)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     print(f"\n==================================================================")
     print(f"🎉 Experiment 3 (E3) Sweep Completed Successfully!")
