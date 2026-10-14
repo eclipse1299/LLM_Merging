@@ -514,16 +514,14 @@ def main():
         "code": resolve_specialist_path("e_code"),
         "instr": resolve_specialist_path("e_instr")
     }
-    specialist_sds = {}
-    for name, path in ckpt_paths.items():
-        specialist_sds[name] = load_state_dict_cpu(path)
-
-    print("Computing task vectors tau = theta_expert - theta_0...")
+    print("\n🧠 Loading Specialist Models and Computing Task Vectors (one-by-one to save RAM)...")
     task_vectors = {}
-    for name, sd in specialist_sds.items():
-        task_vectors[name] = {k: sd[k] - base_sd[k] for k in base_sd.keys()}
-    del specialist_sds
-    gc.collect()
+    for name, path in ckpt_paths.items():
+        sd = load_state_dict_cpu(path)
+        print(f"   • Computing task vector tau_{name} = theta_{name} - theta_0...")
+        task_vectors[name] = {k: (sd[k] - base_sd[k]).to(torch.bfloat16) for k in base_sd.keys()}
+        del sd
+        gc.collect()
 
     # 5. Define Sweep Configurations
     # N=3: [E_pref, E_math, E_code]
