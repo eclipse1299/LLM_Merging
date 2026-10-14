@@ -32,16 +32,49 @@ def load_state_dict_cpu(model_path: str) -> dict[str, torch.Tensor]:
     """Loads model state dict into CPU memory in bfloat16, normalizing key prefixes."""
     print(f"Loading state dict on CPU: {model_path}...")
     if os.path.exists(os.path.join(model_path, "adapter_config.json")):
-        from peft import PeftModel
         print(f"Detected PEFT adapter at {model_path}, baking on CPU...")
-        base = AutoModelForCausalLM.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.bfloat16,
-            device_map="cpu",
-            low_cpu_mem_usage=True
-        )
-        peft_m = PeftModel.from_pretrained(base, model_path)
-        model = peft_m.merge_and_unload()
+        try:
+            from peft import PeftModel
+            base = AutoModelForCausalLM.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+                low_cpu_mem_usage=True
+            )
+            peft_m = PeftModel.from_pretrained(base, model_path)
+            model = peft_m.merge_and_unload()
+            sd = {k: v.to(torch.bfloat16).clone() for k, v in model.state_dict().items()}
+            del peft_m, base, model
+        except Exception as e:
+            print(f"PEFT loading encountered {e}, falling back to pure-PyTorch LoRA baking...")
+            from safetensors.torch import load_file
+            base = AutoModelForCausalLM.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.bfloat16,
+                device_map="cpu",
+                low_cpu_mem_usage=True
+            )
+            sd = {k: v.to(torch.bfloat16).clone() for k, v in base.state_dict().items()}
+            del base
+
+            with open(os.path.join(model_path, "adapter_config.json"), "r") as f:
+                cfg = json.load(f)
+            scale = cfg.get("lora_alpha", 32) / cfg.get("r", 16)
+            safetensors_path = os.path.join(model_path, "adapter_model.safetensors")
+            adapter = load_file(safetensors_path)
+            for k in adapter:
+                if "lora_A" in k:
+                    b_key = k.replace("lora_A", "lora_B")
+                    base_key = k.replace("base_model.model.", "").replace(".lora_A", "")
+                    A = adapter[k].float()
+                    B = adapter[b_key].float()
+                    delta = scale * (B @ A)
+                    clean_k = base_key
+                    for prefix in ["base_model.model.", "base_model."]:
+                        if clean_k.startswith(prefix):
+                            clean_k = clean_k[len(prefix):]
+                    if clean_k in sd:
+                        sd[clean_k] = (sd[clean_k].float() + delta).to(torch.bfloat16)
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
@@ -49,8 +82,8 @@ def load_state_dict_cpu(model_path: str) -> dict[str, torch.Tensor]:
             device_map="cpu",
             low_cpu_mem_usage=True
         )
-    sd = {k: v.to(torch.bfloat16).clone() for k, v in model.state_dict().items()}
-    del model
+        sd = {k: v.to(torch.bfloat16).clone() for k, v in model.state_dict().items()}
+        del model
     import gc
     gc.collect()
     return clean_state_dict_keys(sd)
