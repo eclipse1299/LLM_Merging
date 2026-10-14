@@ -290,6 +290,9 @@ def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tu
     """Evaluates mathematical reasoning accuracy on SVAMP 300 problems."""
     total = len(svamp_items)
     correct = 0
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
+
     for b_idx in range(0, total, batch_size):
         batch = svamp_items[b_idx:b_idx + batch_size]
         prompts = []
@@ -307,7 +310,8 @@ def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tu
                 **inputs,
                 max_new_tokens=256,
                 do_sample=False,
-                pad_token_id=tokenizer.pad_token_id
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids
             )
         gens = tokenizer.batch_decode(outputs[:, in_len:], skip_special_tokens=True)
         for it, gen in zip(batch, gens):
@@ -324,6 +328,9 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
     """Evaluates Python code generation Pass@1 on sanitized MBPP test split (257 problems)."""
     total = len(mbpp_items)
     passed = 0
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
+
     for b_idx in range(0, total, batch_size):
         batch = mbpp_items[b_idx:b_idx + batch_size]
         prompts = []
@@ -343,7 +350,8 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
                 **inputs,
                 max_new_tokens=256,
                 do_sample=False,
-                pad_token_id=tokenizer.pad_token_id
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids
             )
         gens = tokenizer.batch_decode(outputs[:, in_len:], skip_special_tokens=True)
         for it, gen in zip(batch, gens):
@@ -361,6 +369,9 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> 
     """Evaluates strict instruction following on IFEval 300 prompts."""
     total = len(ifeval_items)
     passed_prompts = 0
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
+
     for b_idx in range(0, total, batch_size):
         batch = ifeval_items[b_idx:b_idx + batch_size]
         prompts = []
@@ -375,7 +386,8 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> 
                 **inputs,
                 max_new_tokens=512,
                 do_sample=False,
-                pad_token_id=tokenizer.pad_token_id
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=eos_ids
             )
         gens = tokenizer.batch_decode(outputs[:, in_len:], skip_special_tokens=True)
 
