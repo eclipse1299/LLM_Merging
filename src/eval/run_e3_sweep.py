@@ -282,7 +282,7 @@ def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tu
             ]
             prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(gpu_model.device)
         in_len = inputs.input_ids.shape[1]
         with torch.no_grad():
             outputs = gpu_model.generate(
@@ -318,7 +318,7 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
             ]
             prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to("cuda")
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(gpu_model.device)
         in_len = inputs.input_ids.shape[1]
         with torch.no_grad():
             outputs = gpu_model.generate(
@@ -350,7 +350,7 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> 
             msgs = [{"role": "user", "content": it["prompt"]}]
             prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
 
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to("cuda")
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(gpu_model.device)
         in_len = inputs.input_ids.shape[1]
         with torch.no_grad():
             outputs = gpu_model.generate(
@@ -470,11 +470,12 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     gpu_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=TORCH_DTYPE,
         attn_implementation=ATTN_IMPLEMENTATION
-    ).to("cuda")
+    ).to(device)
     gpu_model.eval()
 
     # 3. Reference Log-Probabilities Cache for B_0
@@ -498,11 +499,20 @@ def main():
     print("\n🧠 Loading Base Model and Specialist State Dicts into CPU RAM (bfloat16)...")
     base_sd = load_state_dict_cpu(MODEL_ID)
 
+    def resolve_specialist_path(name: str) -> str:
+        ckpt = f"outputs/checkpoints/{name}"
+        if os.path.exists(ckpt):
+            return ckpt
+        adapt = f"outputs/adapters/{name}"
+        if os.path.exists(adapt):
+            return adapt
+        return ckpt
+
     ckpt_paths = {
-        "pref": "outputs/checkpoints/e_pref",
-        "math": "outputs/checkpoints/e_math",
-        "code": "outputs/checkpoints/e_code",
-        "instr": "outputs/checkpoints/e_instr"
+        "pref": resolve_specialist_path("e_pref"),
+        "math": resolve_specialist_path("e_math"),
+        "code": resolve_specialist_path("e_code"),
+        "instr": resolve_specialist_path("e_instr")
     }
     specialist_sds = {}
     for name, path in ckpt_paths.items():

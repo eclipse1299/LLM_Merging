@@ -409,12 +409,25 @@ def export_table3(unified_data: dict, output_dir: str = "outputs/results"):
 
 
 def main():
-    e2_path = "outputs/results/e2_sweep_results.json"
-    e3_path = "outputs/results/e3_sweep_results.json"
-    output_dir = "outputs/results"
+    import argparse
+    parser = argparse.ArgumentParser(description="Plot E3 Consortium Scaling and E8 Failure Predictors")
+    parser.add_argument("--e3_path", type=str, default="outputs/results/e3_sweep_results.json",
+                        help="Path to E3 sweep results JSON file")
+    parser.add_argument("--e2_path", type=str, default="outputs/results/e2_sweep_results.json",
+                        help="Path to E2 sweep results JSON file")
+    parser.add_argument("--output_dir", type=str, default="outputs/results",
+                        help="Directory to save generated plots and tables")
+    args = parser.parse_args()
+
+    e2_path = args.e2_path
+    e3_path = args.e3_path
+    output_dir = args.output_dir
 
     print("\n==================================================================")
     print("🚀 Generating E3 Consortium Scaling & E8 Diagnostic Artifacts")
+    print(f"   E2 Source: {e2_path}")
+    print(f"   E3 Source: {e3_path}")
+    print(f"   Output Directory: {output_dir}")
     print("==================================================================\n")
 
     e2_data = load_e2_data(e2_path)
