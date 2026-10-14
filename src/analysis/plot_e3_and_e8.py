@@ -97,10 +97,12 @@ def plot_figure3(unified_data: dict, output_dir: str = "outputs/results"):
             pts = []
             for k, row in unified_data.items():
                 if row["N"] == N and row["method"] == method:
-                    pts.append((row["alpha_pref"], row["prr"]))
+                    pts.append((row["alpha_pref"], row["prr"], row.get("prr_ci95", 0.0)))
             if pts:
                 pts.sort(key=lambda x: x[0])
-                xs, ys = zip(*pts)
+                xs = np.array([p[0] for p in pts])
+                ys = np.array([p[1] for p in pts])
+                yerrs = np.array([p[2] for p in pts])
                 ax.plot(
                     xs, ys,
                     marker=MARKERS_BY_N[N],
@@ -109,6 +111,8 @@ def plot_figure3(unified_data: dict, output_dir: str = "outputs/results"):
                     label=f"$N={N}$ ({'Math' if N==2 else 'Math+Code' if N==3 else 'Math+Code+Instr'})",
                     color=n_colors[N]
                 )
+                if np.any(yerrs > 0):
+                    ax.fill_between(xs, ys - yerrs, ys + yerrs, color=n_colors[N], alpha=0.15)
 
         ax.axhline(100.0, color="purple", linestyle=":", linewidth=1.5, alpha=0.7, label=r"$E_{\text{pref}}$ Anchor (100%)")
         ax.axhline(0.0, color="gray", linestyle="--", linewidth=1.2, alpha=0.6, label=r"Base $B_0$ (0%)")

@@ -83,6 +83,7 @@ def merge_n_experts(
     """
     merged_sd = {}
     N = len(task_vectors)
+    generators = [torch.Generator(device="cpu").manual_seed(RANDOM_SEED + j) for j in range(N)]
 
     for k in base_sd.keys():
         b_val = base_sd[k]
@@ -112,12 +113,11 @@ def merge_n_experts(
             merged_sd[k] = b_val + tau_ties.to(b_val.dtype)
 
         elif method == "dare_ties":
-            # Deterministic DARE per expert tensor to prevent stochastic mask jitter
+            # Deterministic DARE with independent random dropout across all layers
             keep_prob = 1.0 - drop_rate
             dare_taus = []
             for j, (w, tau) in enumerate(zip(weights, tau_list)):
-                gen = torch.Generator(device="cpu").manual_seed(RANDOM_SEED + j)
-                mask = torch.bernoulli(torch.full_like(tau.float(), keep_prob), generator=gen).to(torch.bool)
+                mask = torch.bernoulli(torch.full_like(tau.float(), keep_prob), generator=generators[j]).to(torch.bool)
                 tau_rescaled = (tau.float() * mask) / keep_prob
                 dare_taus.append(w * tau_rescaled)
 
@@ -201,6 +201,8 @@ def compute_failure_diagnostics(
     dot_merged_pref = 0.0
     norm_sq_merged = 0.0
     total_clash_coords = 0
+    total_sign_flips = 0
+    total_zero_pruned = 0
     layer_clash_data = []
 
     for k in base_sd.keys():
@@ -219,15 +221,25 @@ def compute_failure_diagnostics(
             sign_p = pref_signs[k]
             m_flat = m_val.flatten()
             sign_m = torch.sign(m_flat[mask])
+            
+            # Disentangle: opposing sign flip vs. pruned to zero
+            sign_flips = ((sign_p * sign_m) < 0)
+            zero_pruned = (sign_m == 0)
             clashed = (sign_p != sign_m)
 
             n_top = len(sign_p)
+            n_flips = int(sign_flips.sum().item())
+            n_pruned = int(zero_pruned.sum().item())
             n_clash = int(clashed.sum().item())
 
+            total_sign_flips += n_flips
+            total_zero_pruned += n_pruned
             total_clash_coords += n_clash
             layer_clash_data.append({
                 "layer_p_norm_sq": layer_p_norm_sq[k],
                 "layer_top_coords": n_top,
+                "layer_sign_flips": n_flips,
+                "layer_zero_pruned": n_pruned,
                 "layer_clash_coords": n_clash
             })
 
@@ -236,8 +248,10 @@ def compute_failure_diagnostics(
     sum_weighted_norms = sum(weighted_norms)
     eta_pref = (weighted_norms[pref_idx] / max(1e-12, sum_weighted_norms)) if sum_weighted_norms > 0 else 0.0
 
-    # 2. Preference Sign-Overrule Rate (Clash_overruled)
+    # 2. Preference Sign-Overrule Rate (Clash_overruled), Pure Sign Flips, and Pruning Rate
     clash_overruled = (total_clash_coords / max(1, total_top_coords)) if total_top_coords > 0 else 0.0
+    sign_flip_rate = (total_sign_flips / max(1, total_top_coords)) if total_top_coords > 0 else 0.0
+    zero_prune_rate = (total_zero_pruned / max(1, total_top_coords)) if total_top_coords > 0 else 0.0
 
     # 3. Directional Alignment Survival (CosSim_surv)
     norm_m = math.sqrt(max(0.0, norm_sq_merged))
@@ -247,28 +261,34 @@ def compute_failure_diagnostics(
     # 4. Preference Projection Recovery (pi_pref)
     pi_pref = (dot_merged_pref / max(1e-12, norm_sq_pref)) if norm_sq_pref > 0 else 0.0
 
-    # 5. Importance-Weighted Sign Overrule Rate (Clash_weighted)
+    # 5. Importance-Weighted Sign Overrule Rate (Clash_weighted) & Sign Flip Weighted
     clash_weighted = 0.0
+    sign_flip_weighted = 0.0
     if norm_sq_pref > 0:
         for ld in layer_clash_data:
             weight = ld["layer_p_norm_sq"] / norm_sq_pref
             layer_rate = (ld["layer_clash_coords"] / max(1, ld["layer_top_coords"]))
+            layer_flip_rate = (ld["layer_sign_flips"] / max(1, ld["layer_top_coords"]))
             clash_weighted += weight * layer_rate
+            sign_flip_weighted += weight * layer_flip_rate
 
     return {
         "eta_pref": float(eta_pref),
         "clash_overruled": float(clash_overruled),
+        "sign_flip_rate": float(sign_flip_rate),
+        "zero_prune_rate": float(zero_prune_rate),
         "csim_surv": float(csim_surv),
         "pi_pref": float(pi_pref),
-        "clash_weighted": float(clash_weighted)
+        "clash_weighted": float(clash_weighted),
+        "sign_flip_weighted": float(sign_flip_weighted)
     }
 
 
 # ==========================================
 # In-Memory Evaluation Routines
 # ==========================================
-def eval_preference_in_memory(gpu_model, tokenizer, pairs, ref_cache, beta=0.1) -> tuple[float, float, float]:
-    """Computes raw win rate, mean DPO implicit reward margin, and normalized PRR."""
+def eval_preference_in_memory(gpu_model, tokenizer, pairs, ref_cache, beta=0.1) -> tuple[float, float, float, float, float]:
+    """Computes raw win rate, mean DPO implicit reward margin, normalized PRR, dual win-rate PRR, and 95% CI."""
     raw_wins = 0
     margins = []
     for i, it in enumerate(pairs):
@@ -284,13 +304,24 @@ def eval_preference_in_memory(gpu_model, tokenizer, pairs, ref_cache, beta=0.1) 
     raw_rate = (raw_wins / len(pairs)) * 100.0
     mean_margin = float(sum(margins) / len(margins))
     prr = (mean_margin / DELTA_PREF_MARGIN) * 100.0
-    return raw_rate, mean_margin, prr
+
+    # 95% Bootstrap Confidence Interval
+    margins_arr = np.array(margins)
+    se_margin = float(np.std(margins_arr, ddof=1) / np.sqrt(len(margins_arr)))
+    prr_ci95 = float(1.96 * (se_margin / DELTA_PREF_MARGIN) * 100.0)
+
+    # Dual PRR (Section 5.1): Win-Rate PRR (Table 1 anchors: B0=65.0%, E_pref=70.0% => Delta=5.0%)
+    B0_WIN_RATE = 65.0
+    DELTA_WIN_RATE = 5.0
+    prr_win = ((raw_rate - B0_WIN_RATE) / DELTA_WIN_RATE) * 100.0
+
+    return raw_rate, mean_margin, prr, prr_win, prr_ci95
 
 
-def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tuple[float, float]:
-    """Evaluates mathematical reasoning accuracy on SVAMP 300 problems."""
+def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tuple[float, float, float]:
+    """Evaluates mathematical reasoning accuracy on SVAMP 300 problems with 95% CI."""
     total = len(svamp_items)
-    correct = 0
+    correct_flags = []
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
 
@@ -317,18 +348,20 @@ def eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=16) -> tu
         gens = tokenizer.batch_decode(outputs[:, in_len:], skip_special_tokens=True)
         for it, gen in zip(batch, gens):
             pred = extract_predicted_answer(gen)
-            if is_equivalent(pred, it["gold"]):
-                correct += 1
+            correct_flags.append(1 if is_equivalent(pred, it["gold"]) else 0)
 
-    svamp_acc = (correct / total) * 100.0
+    correct_arr = np.array(correct_flags)
+    svamp_acc = (float(correct_arr.sum()) / total) * 100.0
     cr_math = ((svamp_acc - B0_MATH_ACC) / DELTA_MATH) * 100.0
-    return svamp_acc, cr_math
+    se_acc = float(np.std(correct_arr, ddof=1) / np.sqrt(total) * 100.0)
+    cr_math_ci95 = float(1.96 * (se_acc / DELTA_MATH) * 100.0)
+    return svamp_acc, cr_math, cr_math_ci95
 
 
-def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tuple[float, float]:
-    """Evaluates Python code generation Pass@1 on sanitized MBPP test split (257 problems)."""
+def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tuple[float, float, float]:
+    """Evaluates Python code generation Pass@1 on sanitized MBPP test split (257 problems) with 95% CI."""
     total = len(mbpp_items)
-    passed = 0
+    passed_flags = []
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
 
@@ -359,17 +392,20 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=16) -> tupl
         tests = [it["test_list"] for it in batch]
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=1.5), zip(codes, tests)))
-        passed += sum(1 for r in results if r)
+        passed_flags.extend([1 if r else 0 for r in results])
 
-    mbpp_acc = (passed / total) * 100.0
+    passed_arr = np.array(passed_flags)
+    mbpp_acc = (float(passed_arr.sum()) / total) * 100.0
     cr_code = ((mbpp_acc - B0_CODE_ACC) / DELTA_CODE) * 100.0
-    return mbpp_acc, cr_code
+    se_acc = float(np.std(passed_arr, ddof=1) / np.sqrt(total) * 100.0)
+    cr_code_ci95 = float(1.96 * (se_acc / DELTA_CODE) * 100.0)
+    return mbpp_acc, cr_code, cr_code_ci95
 
 
-def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> tuple[float, float]:
-    """Evaluates strict instruction following on IFEval 300 prompts."""
+def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> tuple[float, float, float]:
+    """Evaluates strict instruction following on IFEval 300 prompts with 95% CI."""
     total = len(ifeval_items)
-    passed_prompts = 0
+    passed_flags = []
     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
     eos_ids = [tokenizer.eos_token_id, im_end_id] if im_end_id is not None else tokenizer.eos_token_id
 
@@ -401,12 +437,14 @@ def eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=16) -> 
                 if not check_constraint(inst_id, kw_dict, gen_text, prompt=it["prompt"]):
                     prompt_all_passed = False
                     break
-            if prompt_all_passed and len(instruction_ids) > 0:
-                passed_prompts += 1
+            passed_flags.append(1 if (prompt_all_passed and len(instruction_ids) > 0) else 0)
 
-    ifeval_acc = (passed_prompts / total) * 100.0
+    passed_arr = np.array(passed_flags)
+    ifeval_acc = (float(passed_arr.sum()) / total) * 100.0
     cr_instr = ((ifeval_acc - B0_INSTR_ACC) / DELTA_INSTR) * 100.0
-    return ifeval_acc, cr_instr
+    se_acc = float(np.std(passed_arr, ddof=1) / np.sqrt(total) * 100.0)
+    cr_instr_ci95 = float(1.96 * (se_acc / DELTA_INSTR) * 100.0)
+    return ifeval_acc, cr_instr, cr_instr_ci95
 
 
 # ==========================================
@@ -643,13 +681,13 @@ def main():
 
                 # Run Evaluations with live sub-step reporting
                 print(f"   • Evaluating Preference (200 pairs)...", flush=True)
-                raw_win, dpo_margin, prr = eval_preference_in_memory(gpu_model, tokenizer, pref_pairs, ref_cache)
+                raw_win, dpo_margin, prr, prr_win, prr_ci95 = eval_preference_in_memory(gpu_model, tokenizer, pref_pairs, ref_cache)
 
                 print(f"   • Evaluating SVAMP (300 items)...", flush=True)
-                svamp_acc, cr_math = eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=args.batch_size)
+                svamp_acc, cr_math, cr_math_ci95 = eval_svamp_in_memory(gpu_model, tokenizer, svamp_items, batch_size=args.batch_size)
 
                 print(f"   • Evaluating MBPP (257 items)...", flush=True)
-                mbpp_acc, cr_code = eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=args.batch_size)
+                mbpp_acc, cr_code, cr_code_ci95 = eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=args.batch_size)
 
                 result_entry = {
                     "N": N,
@@ -659,25 +697,30 @@ def main():
                     "raw_win_rate": raw_win,
                     "dpo_margin": dpo_margin,
                     "prr": prr,
+                    "prr_win": prr_win,
+                    "prr_ci95": prr_ci95,
                     "svamp_acc": svamp_acc,
                     "cr_math": cr_math,
+                    "cr_math_ci95": cr_math_ci95,
                     "mbpp_acc": mbpp_acc,
                     "cr_code": cr_code,
+                    "cr_code_ci95": cr_code_ci95,
                     "diagnostics": diagnostics
                 }
 
                 if N == 4:
                     print(f"   • Evaluating IFEval (300 prompts)...", flush=True)
-                    ifeval_acc, cr_instr = eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=args.batch_size)
+                    ifeval_acc, cr_instr, cr_instr_ci95 = eval_ifeval_in_memory(gpu_model, tokenizer, ifeval_items, batch_size=args.batch_size)
                     mean_cr = (cr_math + cr_code + cr_instr) / 3.0
                     result_entry["ifeval_acc"] = ifeval_acc
                     result_entry["cr_instr"] = cr_instr
+                    result_entry["cr_instr_ci95"] = cr_instr_ci95
                     result_entry["mean_cr"] = mean_cr
-                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | CR_i: {cr_instr:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}", flush=True)
+                    print(f"   => PRR: {prr:.1f}% (±{prr_ci95:.1f}%) | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | CR_i: {cr_instr:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f} (Flips: {diagnostics['sign_flip_rate']:.3f})", flush=True)
                 else:
                     mean_cr = (cr_math + cr_code) / 2.0
                     result_entry["mean_cr"] = mean_cr
-                    print(f"   => PRR: {prr:.1f}% | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f}", flush=True)
+                    print(f"   => PRR: {prr:.1f}% (±{prr_ci95:.1f}%) | CR_m: {cr_math:.1f}% | CR_c: {cr_code:.1f}% | Mean CR: {mean_cr:.1f}% | Clash: {diagnostics['clash_overruled']:.3f} (Flips: {diagnostics['sign_flip_rate']:.3f})", flush=True)
 
                 # Atomic save to disk
                 results_dict[key] = result_entry
