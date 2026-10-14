@@ -99,7 +99,7 @@ def merge_n_experts(
             tau_merged = torch.zeros_like(b_val, dtype=torch.float32)
             for w, tau in zip(weights, tau_list):
                 tau_merged += w * tau.float()
-            tau_merged_dict[k] = tau_merged
+            tau_merged_dict[k] = tau_merged.to(torch.bfloat16)
             merged_sd[k] = (b_val.float() + tau_merged).to(b_val.dtype)
 
         elif method == "ties":
@@ -111,7 +111,7 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False  # Crucial: sum agreeing pre-weighted coordinates
             )
-            tau_merged_dict[k] = tau_ties.float()
+            tau_merged_dict[k] = tau_ties.to(torch.bfloat16)
             merged_sd[k] = (b_val.float() + tau_ties.float()).to(b_val.dtype)
 
         elif method == "dare_ties":
@@ -129,7 +129,7 @@ def merge_n_experts(
                 alpha=1.0,
                 divide_by_count=False
             )
-            tau_merged_dict[k] = tau_dare_ties.float()
+            tau_merged_dict[k] = tau_dare_ties.to(torch.bfloat16)
             merged_sd[k] = (b_val.float() + tau_dare_ties.float()).to(b_val.dtype)
 
         else:
@@ -413,8 +413,14 @@ def eval_mbpp_in_memory(gpu_model, tokenizer, mbpp_items, batch_size=64) -> tupl
         all_tests.extend(tests)
 
     # 2. Execute all 257 test suites in parallel across workers without CPU contention
+    def _safe_run(pair):
+        try:
+            return bool(run_with_timeout(pair[0], pair[1], timeout=3.0))
+        except Exception:
+            return False
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(lambda pair: run_with_timeout(pair[0], pair[1], timeout=3.0), zip(all_codes, all_tests)))
+        results = list(pool.map(_safe_run, zip(all_codes, all_tests)))
     passed_arr = np.array([1 if r else 0 for r in results])
 
     mbpp_acc = (float(passed_arr.sum()) / total) * 100.0
